@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>학생 통합 검색 (학부모용)</title>
+  <!-- Tailwind CSS CDN (편의상 사용) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <meta name="color-scheme" content="light dark" />
+  <style>
+    /* 시스템 다크모드 대응 약간의 대비 보정 */
+    :root { color-scheme: light dark; }
+  </style>
+</head>
+<body class="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+  <div class="max-w-3xl mx-auto p-6">
+    <header class="mb-6">
+      <h1 class="text-2xl font-bold">학생 통합 검색 (학부모용)</h1>
+      <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">이름과 생년월일(YYYYMMDD)로 자녀 정보를 조회합니다.</p>
+    </header>
+
+    <!-- 설정 영역: 구글시트 CSV 링크만 바꿔주세요 -->
+    <!-- 예시: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/export?format=csv&gid=SHEET_GID -->
+    <script>
+      const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1NV0y5awUe2BfhFev4Hhqes1VHbuZTC5YFjVxJreA8Nc/edit?usp=sharing"; // TODO: 이 부분을 실제 CSV 내보내기 URL로 교체
+      // 보안 주의: 시트에 민감정보가 있을 경우 '웹 전체공개'는 피하고, Apps Script 프록시 사용 권장.
+    </script>
+
+    <!-- 검색 카드 -->
+    <section class="bg-white dark:bg-gray-800 rounded-2xl shadow p-5">
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+        <div>
+          <label for="name" class="block text-sm font-medium mb-1">이름</label>
+          <input id="name" type="text" placeholder="예: 홍길동"
+                 class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
+        <div>
+          <label for="dob" class="block text-sm font-medium mb-1">생년월일(YYYYMMDD)</label>
+          <input id="dob" type="text" inputmode="numeric" maxlength="8" placeholder="예: 20101123"
+                 class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
+        <div class="flex gap-2 md:justify-end">
+          <button id="searchBtn" class="w-full md:w-auto h-10 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 active:scale-[.99] transition text-white font-semibold">검색</button>
+          <button id="resetBtn" class="w-full md:w-auto h-10 px-4 rounded-xl bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition">초기화</button>
+        </div>
+      </div>
+      <p class="text-xs text-gray-500 dark:text-gray-400 mt-3">※ 정확한 조회를 위해 생년월일 8자리 입력이 필요합니다.</p>
+    </section>
+
+    <!-- 상태 표시 -->
+    <div id="status" class="mt-4 hidden">
+      <div class="flex items-center gap-2 text-sm">
+        <svg class="animate-spin h-4 w-4 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
+        <span id="statusText">데이터 불러오는 중…</span>
+      </div>
+    </div>
+
+    <!-- 결과 영역 -->
+    <section id="result" class="mt-6 space-y-4"></section>
+
+    <footer class="mt-10 text-xs text-gray-500 dark:text-gray-400">
+      <p>ⓘ 개인정보 보호를 위해 공용PC 사용 후 브라우저 캐시/기록을 지워주세요.</p>
+    </footer>
+  </div>
+
+  <script>
+    // ===== 유틸 =====
+    const qs = (sel, el=document) => el.querySelector(sel);
+    const qsa = (sel, el=document) => [...el.querySelectorAll(sel)];
+    const trim = (s) => (s || "").toString().trim();
+    const normDOB = (s) => trim(s).replace(/[^0-9]/g, "").slice(0,8); // 숫자만, 8자리
+
+    // CSV 간단 파서(따옴표 처리 포함)
+    function parseCSV(text) {
+      const rows = [];
+      let cur = '', row = [], insideQuotes = false;
+      for (let i=0; i<text.length; i++) {
+        const c = text[i];
+        if (c === '"') {
+          if (insideQuotes && text[i+1] === '"') { cur += '"'; i++; }
+          else insideQuotes = !insideQuotes;
+        } else if (c === ',' && !insideQuotes) {
+          row.push(cur); cur='';
+        } else if ((c === '\n' || c === '\r') && !insideQuotes) {
+          if (cur !== '' || row.length) { row.push(cur); rows.push(row); row = []; cur=''; }
+        } else {
+          cur += c;
+        }
+      }
+      if (cur !== '' || row.length) row.push(cur), rows.push(row);
+      return rows;
+    }
+
+    function rowsToObjects(rows) {
+      if (!rows || rows.length === 0) return [];
+      const header = rows[0].map(h => trim(h));
+      return rows.slice(1).filter(r => r.some(cell => trim(cell) !== '')).map(r => {
+        const obj = {};
+        header.forEach((h, i) => obj[h] = trim(r[i] ?? ''));
+        return obj;
+      });
+    }
+
+    // ===== 데이터 로딩 & 캐싱 =====
+    let DATA = [];
+    async function loadSheet() {
+      if (!SHEET_CSV_URL || SHEET_CSV_URL.includes('PASTE_YOUR_GOOGLE_SHEET')) {
+        throw new Error('SHEET_CSV_URL을 실제 Google Sheets CSV 내보내기 링크로 교체하세요.');
+      }
+      showStatus('데이터 불러오는 중…');
+      const res = await fetch(SHEET_CSV_URL, { cache: 'no-store' });
+      if (!res.ok) throw new Error('시트 로드 실패(' + res.status + ')');
+      const text = await res.text();
+      const rows = parseCSV(text);
+      DATA = rowsToObjects(rows);
+      hideStatus();
+      return DATA;
+    }
+
+    // ===== UI 상태 =====
+    function showStatus(msg) {
+      const box = qs('#status');
+      qs('#statusText').textContent = msg || '';
+      box.classList.remove('hidden');
+    }
+    function hideStatus() { qs('#status').classList.add('hidden'); }
+
+    function showMessage(html, type='info') {
+      const color = type === 'error' ? 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-100' : 'bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-100';
+      qs('#result').innerHTML = `<div class="${color} rounded-xl p-4 text-sm">${html}</div>`;
+    }
+
+    // ===== 결과 렌더링 =====
+    function renderCard(row) {
+      // 기대 컬럼: 학년 / 반 / 번호 / 이름 / 생년월일 / 동아리
+      const g = row['학년'] || ''; const c = row['반'] || ''; const n = row['번호'] || '';
+      const name = row['이름'] || ''; const dob = row['생년월일'] || ''; const club = row['동아리'] || '';
+      return `
+        <article class="bg-white dark:bg-gray-800 rounded-2xl shadow overflow-hidden">
+          <div class="p-5">
+            <h2 class="text-lg font-semibold flex items-center gap-2">
+              <span class="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-600 text-white text-sm">${String(n || '?')}</span>
+              <span>${name}</span>
+              <span class="ml-2 text-xs px-2 py-1 rounded-full bg-gray-100 dark:bg-gray-700">${g}학년 ${c}반</span>
+            </h2>
+            <dl class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+              <div><dt class="text-gray-500 dark:text-gray-400">생년월일</dt><dd class="font-medium">${dob}</dd></div>
+              <div><dt class="text-gray-500 dark:text-gray-400">동아리</dt><dd class="font-medium">${club || '-'} </dd></div>
+            </dl>
+          </div>
+        </article>`;
+    }
+
+    function renderList(rows) {
+      if (!rows.length) return showMessage('일치하는 학생을 찾지 못했습니다. 이름과 생년월일(8자리)을 다시 확인해주세요.', 'error');
+      if (rows.length === 1) {
+        qs('#result').innerHTML = renderCard(rows[0]);
+      } else {
+        const list = rows.map(renderCard).join('');
+        qs('#result').innerHTML = `
+          <div class="text-sm text-gray-500 dark:text-gray-400 mb-2">동명이인이 있습니다. 아래에서 자녀 정보를 확인해 주세요.</div>
+          <div class="space-y-4">${list}</div>`;
+      }
+    }
+
+    // ===== 검색 =====
+    function search(name, dob) {
+      name = trim(name);
+      dob = normDOB(dob);
+      if (!name || dob.length !== 8) {
+        showMessage('이름과 생년월일(YYYYMMDD)을 모두 입력해 주세요.', 'error');
+        return;
+      }
+      if (!DATA || DATA.length === 0) {
+        showMessage('데이터가 아직 로드되지 않았습니다. 잠시 후 다시 시도해 주세요.', 'error');
+        return;
+      }
+      const matches = DATA.filter(r => trim(r['이름']) === name && normDOB(r['생년월일']) === dob);
+      renderList(matches);
+    }
+
+    // ===== 이벤트 바인딩 =====
+    (function init() {
+      // 데이터 선로딩
+      loadSheet().catch(err => {
+        console.error(err);
+        showMessage('데이터 로드 중 오류가 발생했습니다: ' + err.message, 'error');
+      });
+
+      qs('#searchBtn').addEventListener('click', () => search(qs('#name').value, qs('#dob').value));
+      qs('#resetBtn').addEventListener('click', () => {
+        qs('#name').value = '';
+        qs('#dob').value = '';
+        qs('#result').innerHTML = '';
+      });
+
+      // Enter 키로 검색
+      ['name','dob'].forEach(id => {
+        qs('#' + id).addEventListener('keydown', e => { if (e.key === 'Enter') qs('#searchBtn').click(); });
+      });
+    })();
+  </script>
+</body>
+</html>
